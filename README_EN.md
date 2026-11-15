@@ -28,7 +28,7 @@ Customize recent reactions list with a convenient emoji picker.
 ## 📥 Installation
 
 1. Navigate to the [**Releases**](https://github.com/MaxExteraPlugins/custom_recent_reactions/releases/latest) section.
-2. Download the `custom_recent_reactions_v3.1.0.plugin` file.
+2. Download the `custom_recent_reactions_v3.1.1.plugin` file.
 3. Send the file to your Telegram Saved Messages or open it via file manager in exteraGram / AyuGram.
 4. Tap the file in Telegram and choose **"Install plugin"**.
 
