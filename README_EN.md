@@ -21,7 +21,7 @@
 
 **Custom Recent Reactions** plugin for **exteraGram** and **AyuGram** clients.
 
-Replaces recent reactions in the reaction panel with your own customized set of emojis.
+Customize recent reactions list with a convenient emoji picker.
 
 ---
 
