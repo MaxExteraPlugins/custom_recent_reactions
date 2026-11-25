@@ -125,13 +125,6 @@ public class Main {
     private static Field fHolderPressedBackup;
     private static Method mPlay;
 
-    // Fast bounds for hookCanvasRoundRect (zero reflection on hot path)
-    private static volatile boolean activePanelDrawing;
-    private static volatile float activePanelL = -1f;
-    private static volatile float activePanelT = -1f;
-    private static volatile float activePanelR = -1f;
-    private static volatile float activePanelB = -1f;
-
     // extra-row state per panel (weak: panels are short-lived views)
     private static final Map<ReactionsContainerLayout, ExtraRowState> extraStates = new WeakHashMap<>();
     // panels being dismissed: extra-row work must stop immediately so the
@@ -141,8 +134,6 @@ public class Main {
     // cheap guard for the global hooks: true only while an extra-row panel lives
     private static volatile boolean anyExtraRowActive;
     private static volatile ReactionsContainerLayout lastPanelWithExtraRow;
-    // Props instances of active panels' glass background (identity set)
-    private static final HashSet<Object> activeBlurProps = new HashSet<>();
 
     private static final class ExtraRowState {
         boolean pending;
@@ -214,12 +205,7 @@ public class Main {
         synchronized (closingPanels) {
             closingPanels.clear();
         }
-        synchronized (activeBlurProps) {
-            activeBlurProps.clear();
-        }
         anyExtraRowActive = false;
-        activePanelDrawing = false;
-        activePanelL = activePanelT = activePanelR = activePanelB = -1f;
         lastPanelWithExtraRow = null;
         try {
             System.clearProperty(PROP_ACTIVE);
@@ -609,9 +595,6 @@ public class Main {
     private static void installHooks() {
         hookSetVisibleReactionsList();
         hookDispatchDraw();
-        hookSetGlassBackground();
-        hookBlurPropsBuild();
-        hookCanvasRoundRect();
         hookWindowContainerDraw();
         hookSetCustomEmojiEnterProgress();
     }
@@ -725,14 +708,6 @@ public class Main {
                                 if (isSkip && win != null) {
                                     return;
                                 }
-                                activePanelDrawing = true;
-                                RectF rectBounds = (RectF) getField(fRectField, rcl);
-                                if (rectBounds != null) {
-                                    activePanelL = rectBounds.left;
-                                    activePanelT = rectBounds.top;
-                                    activePanelR = rectBounds.right;
-                                    activePanelB = rectBounds.bottom;
-                                }
                                 // hide the native "+" container while our row owns the plus
                                 Object crc = getField(fCustomContainer, rcl);
                                 if (crc instanceof View && st.keys != null) {
@@ -744,7 +719,6 @@ public class Main {
 
                         @Override
                         public void afterHookedMethod(MethodHookParam param) {
-                            activePanelDrawing = false;
                             try {
                                 if (!anyExtraRowActive) {
                                     return;
@@ -790,172 +764,6 @@ public class Main {
             }
         } catch (Throwable t) {
             log("hook dispatchDraw failed: " + t);
-        }
-    }
-
-    private static void hookSetGlassBackground() {
-        try {
-            Set<XC_MethodHook.Unhook> s = XposedBridge.hookAllMethods(
-                    ReactionsContainerLayout.class, "setGlassBackground", new XC_MethodHook() {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                if (!cfgExtraRow || !cfgEnabled || param.thisObject == null) {
-                                    return;
-                                }
-                                ReactionsContainerLayout rcl = (ReactionsContainerLayout) param.thisObject;
-                                if (panelType(rcl) != 0 || rcl.channelReactions) {
-                                    return;
-                                }
-                                registerBlurProps(rcl);
-                            } catch (Throwable ignore) {
-                            }
-                        }
-                    });
-            if (s != null) {
-                hooks.addAll(s);
-            }
-        } catch (Throwable t) {
-            log("hook setGlassBackground failed: " + t);
-        }
-    }
-
-    /** remember the Props instance bound to an active panel's glass background */
-    private static void registerBlurProps(ReactionsContainerLayout rcl) {
-        try {
-            Object glass = getField(fGlassBg, rcl);
-            if (glass == null) {
-                return;
-            }
-            Method getBound = null;
-            try {
-                getBound = glass.getClass().getDeclaredMethod("getBoundProps");
-            } catch (Throwable ignore) {
-            }
-            Object props = null;
-            if (getBound != null) {
-                try {
-                    getBound.setAccessible(true);
-                    props = getBound.invoke(glass);
-                } catch (Throwable ignore) {
-                }
-            }
-            if (props == null) {
-                for (Field f : glass.getClass().getDeclaredFields()) {
-                    if (Object.class.isAssignableFrom(f.getType()) && f.getType().getName().endsWith("Props")) {
-                        try {
-                            f.setAccessible(true);
-                            Object v = f.get(glass);
-                            if (v != null) {
-                                props = v;
-                                break;
-                            }
-                        } catch (Throwable ignore) {
-                        }
-                    }
-                }
-            }
-            if (props != null) {
-                synchronized (activeBlurProps) {
-                    if (activeBlurProps.size() > 8) {
-                        activeBlurProps.clear();
-                    }
-                    activeBlurProps.add(props);
-                }
-            }
-        } catch (Throwable ignore) {
-        }
-    }
-
-    private static void hookBlurPropsBuild() {
-        try {
-            Class<?> propsCls = Class.forName(
-                    "org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawable$Props");
-            Set<XC_MethodHook.Unhook> s = XposedBridge.hookAllMethods(propsCls, "build", new XC_MethodHook() {
-                @Override
-                public void beforeHookedMethod(MethodHookParam param) {
-                    if (!anyExtraRowActive || param.thisObject == null) {
-                        return;
-                    }
-                    boolean mine;
-                    synchronized (activeBlurProps) {
-                        mine = activeBlurProps.contains(param.thisObject);
-                    }
-                    if (!mine) {
-                        return;
-                    }
-                    clampRadii(param.thisObject, "radii");
-                    clampRadii(param.thisObject, "shaderRadii");
-                }
-            });
-            if (s != null) {
-                hooks.addAll(s);
-            }
-        } catch (Throwable t) {
-            log("hook Props.build failed: " + t);
-        }
-    }
-
-    private static void clampRadii(Object props, String field) {
-        try {
-            Field f = props.getClass().getDeclaredField(field);
-            f.setAccessible(true);
-            float[] arr = (float[]) f.get(props);
-            if (arr == null) {
-                return;
-            }
-            float target = AndroidUtilities.dp(4f);
-            for (int i = 0; i < arr.length; i++) {
-                if (arr[i] > target) {
-                    arr[i] = target;
-                }
-            }
-        } catch (Throwable ignore) {
-        }
-    }
-
-    /** global hook, but the inactive path is a single volatile read */
-    private static void hookCanvasRoundRect() {
-        try {
-            for (Method m : Canvas.class.getDeclaredMethods()) {
-                Class<?>[] pt = m.getParameterTypes();
-                if (!m.getName().equals("drawRoundRect") || pt.length != 4 || pt[0] != RectF.class
-                        || pt[1] != float.class || pt[2] != float.class || pt[3] != Paint.class) {
-                    continue;
-                }
-                XC_MethodHook.Unhook u = XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        if (!activePanelDrawing) {
-                            return;
-                        }
-                        try {
-                            RectF rect = (RectF) param.args[0];
-                            if (rect == null) {
-                                return;
-                            }
-                            float rx = (Float) param.args[1];
-                            float target = AndroidUtilities.dp(4f);
-                            if (rx <= target) {
-                                return;
-                            }
-                            if (Math.abs(rect.left - activePanelL) <= 2f && Math.abs(rect.top - activePanelT) <= 2f
-                                    && Math.abs(rect.right - activePanelR) <= 2f
-                                    && Math.abs(rect.bottom - activePanelB) <= 2f) {
-                                param.args[1] = target;
-                                param.args[2] = target;
-                            }
-                        } catch (Throwable ignore) {
-                        }
-                    }
-                });
-                if (u != null) {
-                    hooks.add(u);
-                }
-                break;
-            }
-        } catch (Throwable t) {
-            log("hook drawRoundRect failed: " + t);
         }
     }
 
@@ -1194,7 +1002,6 @@ public class Main {
             st.keys = vrKeys(items);
         }
         anyExtraRowActive = true;
-        registerBlurProps(rcl);
         if (mainHandler == null) {
             mainHandler = new Handler(Looper.getMainLooper());
         }
