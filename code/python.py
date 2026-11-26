@@ -15,7 +15,7 @@ __id__ = "custom_recent_reactions"
 __name__ = "Custom Recent Reactions"
 __description__ = "Replace the recent reactions in the message reaction panel with your own set."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "3.1.4"
+__version__ = "3.2.1"
 __icon__ = "MaxExteraPluginsStickers/25"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -132,6 +132,10 @@ class Dex:
         return method.invoke(None, *args)
 
     def _read_payload(self):
+        _dex_b64 = globals().get("_DEX_PAYLOAD")
+        if _dex_b64:
+            import base64, zlib
+            return zlib.decompress(base64.b64decode(_dex_b64))
         with open(__file__, "r", encoding="utf-8") as f:
             text = f.read()
         body = text.split("# " + DEX_BEGIN, 1)[1].split("# " + DEX_END, 1)[0]

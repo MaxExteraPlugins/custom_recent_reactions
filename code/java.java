@@ -9,12 +9,13 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -29,21 +30,28 @@ import org.telegram.messenger.Emoji;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MediaDataController;
 import org.telegram.messenger.UserConfig;
+import org.telegram.messenger.Utilities;
 import org.telegram.tgnet.TLRPC;
-import org.telegram.tgnet.tl.TL_stars;
-import org.telegram.ui.ActionBar.AlertDialog;
+import org.telegram.ui.ActionBar.ActionBar;
+import org.telegram.ui.ActionBar.ActionBarMenu;
+import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.AnimatedEmojiDrawable;
-import org.telegram.ui.Components.BackupImageView;
+import org.telegram.ui.Components.AnimatedEmojiSpan;
 import org.telegram.ui.Components.LayoutHelper;
+import org.telegram.ui.Components.Reactions.BackSpaceButtonView;
+import org.telegram.ui.Components.Reactions.CustomReactionEditText;
 import org.telegram.ui.Components.Reactions.ReactionsLayoutInBubble;
+import org.telegram.ui.Components.Reactions.ReactionsUtils;
 import org.telegram.ui.Components.ReactionsContainerLayout;
+import org.telegram.ui.LaunchActivity;
 import org.telegram.ui.SelectAnimatedEmojiDialog;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -91,7 +99,7 @@ public class Main {
     // caches
     // ------------------------------------------------------------------
     private static final Object buildLock = new Object();
-    private static ArrayList<ReactionsLayoutInBubble.VisibleReaction> builtList;
+    private static ArrayList<Object> builtList;
     private static int builtGen = -1;
     private static int builtAccount = -1;
 
@@ -124,6 +132,13 @@ public class Main {
     private static Field fHolderCurrentReaction;
     private static Field fHolderPressedBackup;
     private static Method mPlay;
+    private static Class<?> visibleReactionClass;
+    private static Method mVrFromCustomEmoji;
+    private static Method mVrFromEmojicon;
+    private static Field fVrIsStar;
+    private static Field fVrDocumentId;
+    private static Field fVrEmojicon;
+    private static Method mOnReactionClicked;
 
     // extra-row state per panel (weak: panels are short-lived views)
     private static final Map<ReactionsContainerLayout, ExtraRowState> extraStates = new WeakHashMap<>();
@@ -382,7 +397,7 @@ public class Main {
         return input;
     }
 
-    private static ArrayList<ReactionsLayoutInBubble.VisibleReaction> buildReactionsList(int account) {
+    private static ArrayList<Object> buildReactionsList(int account) {
         List<String> items = cfgItems;
         if (items == null) {
             readPrefsIntoConfig();
@@ -397,7 +412,7 @@ public class Main {
                 return builtList;
             }
         }
-        ArrayList<ReactionsLayoutInBubble.VisibleReaction> out = new ArrayList<>();
+        ArrayList<Object> out = new ArrayList<>();
         HashSet<String> seen = new HashSet<>();
         for (int i = 0; i < items.size(); i++) {
             String item = items.get(i);
@@ -405,12 +420,12 @@ public class Main {
                 continue;
             }
             item = item.trim();
-            ReactionsLayoutInBubble.VisibleReaction vr;
+            Object vr;
             String key;
             if (item.startsWith("doc:")) {
                 try {
                     long docId = Long.parseLong(item.substring(4).trim());
-                    vr = ReactionsLayoutInBubble.VisibleReaction.fromCustomEmoji(docId);
+                    vr = vrFromCustomEmoji(docId);
                     key = "d:" + docId;
                 } catch (Throwable t) {
                     continue;
@@ -427,7 +442,7 @@ public class Main {
                     continue;
                 }
                 String matched = matchEmoticon(emoji, account);
-                vr = ReactionsLayoutInBubble.VisibleReaction.fromEmojicon(matched);
+                vr = vrFromEmojicon(matched);
                 key = "e:" + matched;
             }
             if (vr != null && seen.add(key)) {
@@ -455,15 +470,14 @@ public class Main {
                 if (dup) {
                     continue;
                 }
-                ReactionsLayoutInBubble.VisibleReaction vr =
-                        ReactionsLayoutInBubble.VisibleReaction.fromEmojicon(matchEmoticon(se, account));
+                Object vr = vrFromEmojicon(matchEmoticon(se, account));
                 if (vr != null) {
                     out.add(vr);
                     seen.add("e:" + se);
                 }
             }
         }
-        ArrayList<ReactionsLayoutInBubble.VisibleReaction> result = out.isEmpty() ? null : out;
+        ArrayList<Object> result = out.isEmpty() ? null : out;
         synchronized (buildLock) {
             builtList = result;
             builtGen = gen;
@@ -486,6 +500,26 @@ public class Main {
         fReactionsWindow = resolveField("reactionsWindow");
         fSkipDraw = resolveField("skipDraw");
         try {
+            visibleReactionClass = Class.forName(
+                    "org.telegram.ui.Components.Reactions.ReactionsLayoutInBubble$VisibleReaction");
+            mVrFromCustomEmoji = visibleReactionClass.getMethod("fromCustomEmoji", Long.TYPE);
+            mVrFromEmojicon = visibleReactionClass.getMethod("fromEmojicon", String.class);
+            fVrIsStar = visibleReactionClass.getField("isStar");
+            fVrDocumentId = visibleReactionClass.getField("documentId");
+            fVrEmojicon = visibleReactionClass.getField("emojicon");
+        } catch (Throwable ignore) {
+            visibleReactionClass = null;
+        }
+        try {
+            if (visibleReactionClass != null) {
+                mOnReactionClicked = ReactionsContainerLayout.class.getMethod(
+                        "onReactionClicked", View.class, visibleReactionClass, Boolean.TYPE);
+                mOnReactionClicked.setAccessible(true);
+            }
+        } catch (Throwable ignore) {
+            mOnReactionClicked = null;
+        }
+        try {
             holderViewClass = Class.forName("org.telegram.ui.Components.ReactionsContainerLayout$ReactionHolderView");
             cHolderView = holderViewClass.getDeclaredConstructor(
                     ReactionsContainerLayout.class, Context.class, Boolean.TYPE);
@@ -494,9 +528,11 @@ public class Main {
             fHolderCurrentReaction.setAccessible(true);
             fHolderPressedBackup = holderViewClass.getDeclaredField("pressedBackupImageView");
             fHolderPressedBackup.setAccessible(true);
-            mSetReaction = holderViewClass.getMethod("-$$Nest$msetReaction", holderViewClass,
-                    ReactionsLayoutInBubble.VisibleReaction.class, Integer.TYPE);
-            mSetReaction.setAccessible(true);
+            if (visibleReactionClass != null) {
+                mSetReaction = holderViewClass.getMethod("-$$Nest$msetReaction", holderViewClass,
+                        visibleReactionClass, Integer.TYPE);
+                mSetReaction.setAccessible(true);
+            }
             try {
                 mPlay = holderViewClass.getMethod("play", Integer.TYPE);
                 mPlay.setAccessible(true);
@@ -624,7 +660,7 @@ public class Main {
                                 } catch (Throwable t) {
                                     account = 0;
                                 }
-                                List<ReactionsLayoutInBubble.VisibleReaction> list = buildReactionsList(account);
+                                List<Object> list = buildReactionsList(account);
                                 if (list != null && !list.isEmpty()) {
                                     param.args[0] = new ArrayList<>(list);
                                 }
@@ -921,14 +957,85 @@ public class Main {
     // extra row ("one more row" mode, up to 14 reactions)
     // ==================================================================
 
-    private static String vrKeys(List<ReactionsLayoutInBubble.VisibleReaction> vrs) {
+    private static boolean isVr(Object o) {
+        return o != null && visibleReactionClass != null && visibleReactionClass.isInstance(o);
+    }
+
+    private static Object vrFromCustomEmoji(long docId) {
+        if (mVrFromCustomEmoji == null) {
+            return null;
+        }
+        try {
+            return mVrFromCustomEmoji.invoke(null, Long.valueOf(docId));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static Object vrFromEmojicon(String emojicon) {
+        if (mVrFromEmojicon == null || emojicon == null) {
+            return null;
+        }
+        try {
+            return mVrFromEmojicon.invoke(null, emojicon);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static boolean vrIsStar(Object vr) {
+        if (vr == null || fVrIsStar == null) {
+            return false;
+        }
+        try {
+            return fVrIsStar.getBoolean(vr);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static long vrDocumentId(Object vr) {
+        if (vr == null || fVrDocumentId == null) {
+            return 0L;
+        }
+        try {
+            return fVrDocumentId.getLong(vr);
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    private static String vrEmojicon(Object vr) {
+        if (vr == null || fVrEmojicon == null) {
+            return null;
+        }
+        try {
+            Object v = fVrEmojicon.get(vr);
+            return v != null ? v.toString() : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static void invokeOnReactionClicked(ReactionsContainerLayout rcl, View v, Object vr, boolean longPress) {
+        if (rcl == null || mOnReactionClicked == null || !isVr(vr)) {
+            return;
+        }
+        try {
+            mOnReactionClicked.invoke(rcl, v, vr, Boolean.valueOf(longPress));
+        } catch (Throwable ignore) {
+        }
+    }
+
+    private static String vrKeys(List<Object> vrs) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < vrs.size(); i++) {
-            ReactionsLayoutInBubble.VisibleReaction vr = vrs.get(i);
-            if (vr != null && vr.emojicon != null) {
-                sb.append('e').append(vr.emojicon).append('|');
+            Object vr = vrs.get(i);
+            String em = vrEmojicon(vr);
+            if (vr != null && em != null) {
+                sb.append('e').append(em).append('|');
             } else if (vr != null) {
-                sb.append('d').append(vr.documentId).append('|');
+                sb.append('d').append(vrDocumentId(vr)).append('|');
             }
         }
         return sb.toString();
@@ -944,13 +1051,12 @@ public class Main {
                 View c = row.getChildAt(i);
                 if (c != null && holderViewClass.isInstance(c)) {
                     Object r = fHolderCurrentReaction.get(c);
-                    if (r instanceof ReactionsLayoutInBubble.VisibleReaction) {
-                        ReactionsLayoutInBubble.VisibleReaction vr =
-                                (ReactionsLayoutInBubble.VisibleReaction) r;
-                        if (vr.emojicon != null) {
-                            sb.append('e').append(vr.emojicon).append('|');
+                    if (isVr(r)) {
+                        String em = vrEmojicon(r);
+                        if (em != null) {
+                            sb.append('e').append(em).append('|');
                         } else {
-                            sb.append('d').append(vr.documentId).append('|');
+                            sb.append('d').append(vrDocumentId(r)).append('|');
                         }
                     }
                 }
@@ -969,16 +1075,14 @@ public class Main {
         if (n <= 7) {
             return;
         }
-        final ArrayList<ReactionsLayoutInBubble.VisibleReaction> items = new ArrayList<>(n - 8);
+        final ArrayList<Object> items = new ArrayList<>(n - 8);
         for (int i = 8; i < n; i++) {
             Object o = full.get(i);
-            if (o instanceof ReactionsLayoutInBubble.VisibleReaction) {
-                items.add((ReactionsLayoutInBubble.VisibleReaction) o);
+            if (isVr(o)) {
+                items.add(o);
             }
         }
-        final ReactionsLayoutInBubble.VisibleReaction vr8 =
-                full.get(7) instanceof ReactionsLayoutInBubble.VisibleReaction
-                        ? (ReactionsLayoutInBubble.VisibleReaction) full.get(7) : null;
+        final Object vr8 = isVr(full.get(7)) ? full.get(7) : null;
 
         final ExtraRowState st;
         synchronized (extraStates) {
@@ -1015,8 +1119,8 @@ public class Main {
     }
 
     private static void finishExtraRow(final ReactionsContainerLayout rcl,
-                                       final ArrayList<ReactionsLayoutInBubble.VisibleReaction> items,
-                                       final ReactionsLayoutInBubble.VisibleReaction vr8,
+                                       final ArrayList<Object> items,
+                                       final Object vr8,
                                        final int tries) {
         try {
             ExtraRowState st;
@@ -1160,8 +1264,8 @@ public class Main {
     }
 
     private static void repostExtra(final ReactionsContainerLayout rcl,
-                                    final ArrayList<ReactionsLayoutInBubble.VisibleReaction> items,
-                                    final ReactionsLayoutInBubble.VisibleReaction vr8,
+                                    final ArrayList<Object> items,
+                                    final Object vr8,
                                     final int tries) {
         mainHandler.postDelayed(new Runnable() {
             @Override
@@ -1188,7 +1292,7 @@ public class Main {
     }
 
     private static LinearLayout createRow2(final ReactionsContainerLayout rcl,
-                                           ArrayList<ReactionsLayoutInBubble.VisibleReaction> items,
+                                           ArrayList<Object> items,
                                            int cellW, int btnH) {
         try {
             Context ctx = rcl.getContext();
@@ -1197,7 +1301,7 @@ public class Main {
             row2.setTag("crr_row2");
             row2.setPadding(AndroidUtilities.dp(8), 0, 0, 0);
             for (int i = 0; i < items.size(); i++) {
-                final ReactionsLayoutInBubble.VisibleReaction vr = items.get(i);
+                final Object vr = items.get(i);
                 View holder = (View) cHolderView.newInstance(rcl, ctx, Boolean.TRUE);
                 mSetReaction.invoke(null, holder, vr, Integer.valueOf(i + 8));
                 hidePressedBackup(holder);
@@ -1206,9 +1310,8 @@ public class Main {
                     public void onClick(View v) {
                         try {
                             Object cr = fHolderCurrentReaction.get(v);
-                            if (cr instanceof ReactionsLayoutInBubble.VisibleReaction) {
-                                rcl.onReactionClicked(v,
-                                        (ReactionsLayoutInBubble.VisibleReaction) cr, false);
+                            if (isVr(cr)) {
+                                invokeOnReactionClicked(rcl, v, cr, false);
                             }
                         } catch (Throwable ignore) {
                         }
@@ -1352,7 +1455,7 @@ public class Main {
     }
 
     private static void ensureX8(final ReactionsContainerLayout rcl,
-                                 ReactionsLayoutInBubble.VisibleReaction vr8,
+                                 Object vr8,
                                  int cellW, int btnH) {
         try {
             if (rcl.findViewWithTag("crr_x8") != null || cHolderView == null || mSetReaction == null) {
@@ -1368,9 +1471,8 @@ public class Main {
                 public void onClick(View v) {
                     try {
                         Object cr = fHolderCurrentReaction.get(x8);
-                        if (cr instanceof ReactionsLayoutInBubble.VisibleReaction) {
-                            rcl.onReactionClicked(v,
-                                    (ReactionsLayoutInBubble.VisibleReaction) cr, false);
+                        if (isVr(cr)) {
+                            invokeOnReactionClicked(rcl, v, cr, false);
                         }
                     } catch (Throwable ignore) {
                     }
@@ -1600,308 +1702,539 @@ public class Main {
     }
 
     // ==================================================================
-    // picker (native, SelectAnimatedEmojiDialog-based, TG-channel style)
+    // picker (native TG-channel style BaseFragment + CustomReactionEditText)
     // ==================================================================
 
     public static void pyShowPicker(Object contextObj) {
         try {
-            Context context;
-            if (contextObj instanceof Context) {
-                context = (Context) contextObj;
+            BaseFragment target = null;
+            if (contextObj instanceof BaseFragment) {
+                target = (BaseFragment) contextObj;
+            }
+            if (target == null) {
+                try {
+                    target = LaunchActivity.getLastFragment();
+                } catch (Throwable ignore) {
+                }
+            }
+            if (target != null) {
+                target.presentFragment(new ReactionsPickerActivity());
             } else {
-                context = ApplicationLoader.applicationContext;
+                log("pyShowPicker: no active BaseFragment found");
             }
-            if (context == null) {
-                return;
-            }
-            showPicker(context);
         } catch (Throwable t) {
             log("pyShowPicker: " + t);
         }
     }
 
-    private static void showPicker(final Context context) {
-        final int account;
-        try {
-            account = UserConfig.selectedAccount;
-        } catch (Throwable t) {
-            return;
-        }
+    public static void pyOpenPickerFragment(Object fragmentObj) {
+        pyShowPicker(fragmentObj);
+    }
 
-        // current selection (ordered)
-        final ArrayList<String> selected = new ArrayList<>();
-        List<String> cfg = cfgItems;
-        if (cfg == null) {
-            readPrefsIntoConfig();
-            cfg = cfgItems;
-        }
-        if (cfg != null) {
-            for (String s : cfg) {
-                if (s != null && !s.trim().isEmpty()) {
-                    selected.add(normalizeItem(s));
+    public static class ReactionsPickerActivity extends BaseFragment {
+        private CustomReactionEditText editText;
+        private SelectAnimatedEmojiDialog emojiDialog;
+        private BackSpaceButtonView backspaceView;
+        private FrameLayout bottomWrap;
+        private TextView countBadge;
+        private final ArrayList<String> selected = new ArrayList<>();
+        private final ArrayList<Integer> itemCharOffsets = new ArrayList<>();
+        private final HashMap<String, TLRPC.TL_availableReaction> availableByEmoji = new HashMap<>();
+        private int cursorIndex = 0;
+        private boolean isUpdatingText = false;
+        private boolean changed = false;
+        private final ArrayList<XC_MethodHook.Unhook> pickerHooks = new ArrayList<>();
+
+        @Override
+        public boolean onFragmentCreate() {
+            List<String> cfg = cfgItems;
+            if (cfg == null) {
+                readPrefsIntoConfig();
+                cfg = cfgItems;
+            }
+            if (cfg != null) {
+                for (String s : cfg) {
+                    if (s != null && !s.trim().isEmpty()) {
+                        selected.add(normalizeItem(s));
+                    }
                 }
             }
-        }
-
-        LinearLayout root = new LinearLayout(context);
-        root.setOrientation(LinearLayout.VERTICAL);
-
-        // ---- header: title + count chip ----
-        LinearLayout header = new LinearLayout(context);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12),
-                AndroidUtilities.dp(20), AndroidUtilities.dp(4));
-
-        TextView title = new TextView(context);
-        title.setText(loc("Pick reactions", "Выбор реакций"));
-        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-
-        final TextView chip = new TextView(context);
-        chip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-        chip.setTypeface(Typeface.DEFAULT_BOLD);
-        chip.setGravity(Gravity.CENTER);
-        chip.setMinWidth(AndroidUtilities.dp(34));
-        chip.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(3),
-                AndroidUtilities.dp(10), AndroidUtilities.dp(3));
-        chip.setTextColor(0xFFFFFFFF);
-        chip.setBackground(Theme.createRoundRectDrawable(
-                Theme.getColor(Theme.key_featuredStickers_buttonText), AndroidUtilities.dp(12)));
-
-        header.addView(title);
-        header.addView(new View(context), new LinearLayout.LayoutParams(0, 1, 1f));
-        header.addView(chip);
-        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
-
-        // ---- preview strip ----
-        FrameLayout previewContainer = new FrameLayout(context);
-        previewContainer.setBackground(Theme.createRoundRectDrawable(
-                Theme.getColor(Theme.key_chat_inReactionButtonBackground), AndroidUtilities.dp(16)));
-        HorizontalScrollView previewScroll = new HorizontalScrollView(context);
-        previewScroll.setHorizontalScrollBarEnabled(false);
-        final LinearLayout previewRow = new LinearLayout(context);
-        previewRow.setOrientation(LinearLayout.HORIZONTAL);
-        previewRow.setGravity(Gravity.CENTER_VERTICAL);
-        previewRow.setPadding(AndroidUtilities.dp(8), 0, AndroidUtilities.dp(8), 0);
-        previewScroll.addView(previewRow);
-        previewContainer.addView(previewScroll,
-                new FrameLayout.LayoutParams(-1, AndroidUtilities.dp(44)));
-        root.addView(previewContainer, new LinearLayout.LayoutParams(-1, AndroidUtilities.dp(52)));
-
-        TextView subHint = new TextView(context);
-        subHint.setText(loc("Tap to move cursor, hold to remove reaction",
-                            "Нажатие — перемещение курсора, удерживание — удаление реакции"));
-        subHint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
-        subHint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
-        subHint.setGravity(Gravity.CENTER_HORIZONTAL);
-        subHint.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(4),
-                AndroidUtilities.dp(16), AndroidUtilities.dp(6));
-        root.addView(subHint, new LinearLayout.LayoutParams(-1, -2));
-
-        // ---- native emoji picker ----
-        final SelectAnimatedEmojiDialog[] dialogRef = new SelectAnimatedEmojiDialog[1];
-        final Runnable[] refreshRef = new Runnable[1];
-        // insertion cursor: index in `selected` where the next tapped
-        // reaction will be inserted (tap a preview item to move it)
-        final int[] insIdx = new int[1];
-        insIdx[0] = selected.size();
-        final Runnable refreshUi = new Runnable() {
-            @Override
-            public void run() {
-                chip.setText(String.valueOf(selected.size()));
-                previewRow.removeAllViews();
-                if (selected.isEmpty()) {
-                    insIdx[0] = 0;
-                    TextView hint = new TextView(context);
-                    hint.setText(loc("Tap emoji to add — no limit", "Нажимайте на эмодзи, чтобы добавить — без ограничений"));
-                    hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-                    hint.setGravity(Gravity.CENTER);
-                    hint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
-                    previewRow.addView(hint, new LinearLayout.LayoutParams(-1, -2));
-                } else {
-                    if (insIdx[0] > selected.size()) {
-                        insIdx[0] = selected.size();
-                    }
-                    for (int i = 0; i < selected.size(); i++) {
-                        if (i == insIdx[0]) {
-                            previewRow.addView(makeCursorView(context),
-                                    new LinearLayout.LayoutParams(AndroidUtilities.dp(14), AndroidUtilities.dp(40)));
-                        }
-                        final String item = selected.get(i);
-                        final int at = i;
-                        View cell = makePreviewCell(context, item, account,
-                                new Runnable() {
-                                    @Override
-                                    public void run() { // tap: move cursor before this item
-                                        insIdx[0] = at;
-                                        refreshRef[0].run();
-                                    }
-                                },
-                                new Runnable() {
-                                    @Override
-                                    public void run() { // long-press: remove
-                                        int p = selected.indexOf(item);
-                                        if (p >= 0) {
-                                            selected.remove(p);
-                                            if (insIdx[0] > p) {
-                                                insIdx[0]--;
-                                            }
-                                        }
-                                        syncDialogSelection(dialogRef[0], selected, account);
-                                        refreshRef[0].run();
-                                    }
-                                });
-                        previewRow.addView(cell,
-                                new LinearLayout.LayoutParams(AndroidUtilities.dp(40), AndroidUtilities.dp(40)));
-                    }
-                    if (insIdx[0] >= selected.size()) {
-                        previewRow.addView(makeCursorView(context),
-                                new LinearLayout.LayoutParams(AndroidUtilities.dp(14), AndroidUtilities.dp(40)));
-                    }
-                }
-                syncDialogSelection(dialogRef[0], selected, account);
-                // keep the cursor visible in the strip
-                previewScroll.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            int x = insIdx[0] * AndroidUtilities.dp(40) + AndroidUtilities.dp(8);
-                            previewScroll.scrollTo(Math.max(0, x - previewScroll.getWidth() / 2), 0);
-                        } catch (Throwable ignore) {
+            try {
+                List<TLRPC.TL_availableReaction> avail = MediaDataController
+                        .getInstance(currentAccount).getReactionsList();
+                if (avail != null) {
+                    for (int i = 0; i < avail.size(); i++) {
+                        TLRPC.TL_availableReaction r = avail.get(i);
+                        if (r != null && r.reaction != null) {
+                            availableByEmoji.put(r.reaction.replace("\uFE0F", ""), r);
                         }
                     }
-                });
-            }
-        };
-        refreshRef[0] = refreshUi;
-
-        SelectAnimatedEmojiDialog emojiDialog = new SelectAnimatedEmojiDialog(
-                null, context, false, null,
-                1 /* TYPE_REACTIONS — same as the native "+" reaction window */,
-                true, null, 16) {
-            @Override
-            public void onReactionClick(SelectAnimatedEmojiDialog.ImageViewEmoji emoji,
-                                        ReactionsLayoutInBubble.VisibleReaction reaction) {
-                if (reaction == null || reaction.isStar) {
-                    return;
                 }
-                if (reaction.emojicon != null) {
-                    toggleAt("e:" + reaction.emojicon.replace("\uFE0F", ""), selected, insIdx);
-                    refreshUi.run();
-                }
+            } catch (Throwable ignore) {
             }
+            cursorIndex = selected.size();
+            return super.onFragmentCreate();
+        }
 
-            @Override
-            public void onEmojiSelected(View view, Long documentId, TLRPC.Document document,
-                                        TL_stars.TL_starGiftUnique gift, Integer until) {
-                if (documentId != null && documentId != 0) {
-                    toggleAt("doc:" + documentId, selected, insIdx);
-                    refreshUi.run();
-                }
-            }
+        @Override
+        public boolean isSupportEdgeToEdge() {
+            return true;
+        }
 
-            @Override
-            public void onEmojiSelected(View view, Long documentId, TLRPC.Document document,
-                                        TL_stars.TL_starGiftUnique gift, Integer until, String emoticon) {
-                if (documentId != null && documentId != 0) {
-                    toggleAt("doc:" + documentId, selected, insIdx);
-                    refreshUi.run();
-                }
-            }
-
-            @Override
-            public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-                // The native dialog measures itself to a fixed ~324dp width;
-                // keep that (the bubble design), but take the height the
-                // parent gives us instead of the native AT_MOST cap.
-                int w = (int) Math.min(AndroidUtilities.dp(340 - 16),
-                        AndroidUtilities.displaySize.x * 0.95f);
-                super.onMeasure(
-                        View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
-                        heightMeasureSpec);
-            }
-        };
-        dialogRef[0] = emojiDialog;
-        // drawBackground stays true (the ctor param is never applied to the
-        // field) — the dialog paints its native bubble and onShow() below
-        // runs the reveal animation that makes tabs and cells visible.
-
-        // rows on top: current picks, then every standard enabled reaction
-        ArrayList<ReactionsLayoutInBubble.VisibleReaction> recents = new ArrayList<>();
-        LinkedHashSet<String> seenRecent = new LinkedHashSet<>();
-        for (int i = 0; i < selected.size(); i++) {
-            ReactionsLayoutInBubble.VisibleReaction vr = itemToVr(selected.get(i), account);
-            if (vr != null && seenRecent.add(keyOf(vr))) {
-                recents.add(vr);
+        @Override
+        public void onInsets(int left, int top, int right, int bottom) {
+            if (bottomWrap != null) {
+                bottomWrap.setPadding(left, 0, right, bottom);
             }
         }
-        List<String> std = standardEmojis(account);
-        for (int i = 0; i < std.size(); i++) {
-            String se = std.get(i);
-            if (se == null || se.isEmpty()) {
-                continue;
-            }
-            ReactionsLayoutInBubble.VisibleReaction vr = ReactionsLayoutInBubble.VisibleReaction
-                    .fromEmojicon(matchEmoticon(se, account));
-            if (vr != null && seenRecent.add(keyOf(vr))) {
-                recents.add(vr);
-            }
-        }
-        try {
-            emojiDialog.setRecentReactions(recents);
-        } catch (Throwable ignore) {
-        }
-        syncDialogSelection(emojiDialog, selected, account);
 
-        int pickH = Math.max(AndroidUtilities.dp(280),
-                Math.min(AndroidUtilities.dp(430),
-                        AndroidUtilities.displaySize.y - AndroidUtilities.dp(250)));
-        // The dialog forces its own fixed width, so center it inside the sheet
-        FrameLayout dialogWrap = new FrameLayout(context);
-        dialogWrap.addView(emojiDialog,
-                new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL));
-        root.addView(dialogWrap, new LinearLayout.LayoutParams(-1, pickH));
+        @Override
+        public View createView(Context context) {
+            actionBar.setBackButtonImage(org.telegram.messenger.R.drawable.ic_ab_back);
+            actionBar.setTitle(loc("Pick reactions", "Выбор реакций"));
+            updateSubtitle();
 
-        AlertDialog.Builder builder = new AlertDialog.Builder(context);
-        builder.setView(root);
-        builder.setPositiveButton(loc("Done", "Готово"), new AlertDialog.OnButtonClickListener() {
-            @Override
-            public void onClick(AlertDialog dialog, int which) {
-                try {
-                    saveReactionsToPrefs(selected);
-                    readPrefsIntoConfig();
-                } catch (Throwable ignore) {
+            ActionBarMenu menu = actionBar.createMenu();
+            menu.addItem(1, org.telegram.messenger.R.drawable.ic_ab_done);
+            menu.addItem(2, loc("Reset", "Сброс"));
+
+            actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
+                @Override
+                public void onItemClick(int id) {
+                    if (id == -1 || id == 1) {
+                        saveAndExit();
+                    } else if (id == 2) {
+                        selected.clear();
+                        for (String e : DEFAULT_EMOJI) {
+                            selected.add("e:" + e);
+                        }
+                        cursorIndex = selected.size();
+                        changed = true;
+                        updateUi();
+                    }
+                }
+            });
+
+            FrameLayout root = new FrameLayout(context);
+            root.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
+
+            LinearLayout content = new LinearLayout(context);
+            content.setOrientation(LinearLayout.VERTICAL);
+            root.addView(content, LayoutHelper.createFrame(-1, -1));
+
+            // ---- Top scrollable area with native CustomReactionEditText ----
+            android.widget.ScrollView topScroll = new android.widget.ScrollView(context);
+            topScroll.setFillViewport(true);
+            LinearLayout topContainer = new LinearLayout(context);
+            topContainer.setOrientation(LinearLayout.VERTICAL);
+            topScroll.addView(topContainer, new FrameLayout.LayoutParams(-1, -2));
+
+            LinearLayout card = new LinearLayout(context);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setBackground(Theme.createRoundRectDrawable(
+                    Theme.getColor(Theme.key_windowBackgroundWhite), AndroidUtilities.dp(16)));
+            LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            cardLp.setMargins(AndroidUtilities.dp(12), AndroidUtilities.dp(12),
+                    AndroidUtilities.dp(12), AndroidUtilities.dp(8));
+            card.setLayoutParams(cardLp);
+            card.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(12),
+                    AndroidUtilities.dp(14), AndroidUtilities.dp(12));
+
+            LinearLayout headerRow = new LinearLayout(context);
+            headerRow.setOrientation(LinearLayout.HORIZONTAL);
+            headerRow.setGravity(Gravity.CENTER_VERTICAL);
+
+            TextView titleView = new TextView(context);
+            titleView.setText(loc("Selected reactions", "Выбранные реакции"));
+            titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+            titleView.setTypeface(Typeface.DEFAULT_BOLD);
+            titleView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+
+            countBadge = new TextView(context);
+            countBadge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+            countBadge.setTypeface(Typeface.DEFAULT_BOLD);
+            countBadge.setGravity(Gravity.CENTER);
+            countBadge.setMinWidth(AndroidUtilities.dp(28));
+            countBadge.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(2),
+                    AndroidUtilities.dp(8), AndroidUtilities.dp(2));
+            countBadge.setTextColor(0xFFFFFFFF);
+            countBadge.setBackground(Theme.createRoundRectDrawable(
+                    Theme.getColor(Theme.key_featuredStickers_buttonText), AndroidUtilities.dp(10)));
+
+            headerRow.addView(titleView);
+            headerRow.addView(new View(context), new LinearLayout.LayoutParams(0, 1, 1f));
+            headerRow.addView(countBadge);
+            card.addView(headerRow, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            LinearLayout editRow = new LinearLayout(context);
+            editRow.setOrientation(LinearLayout.HORIZONTAL);
+            editRow.setGravity(Gravity.CENTER_VERTICAL);
+
+            editText = new CustomReactionEditText(context, getResourceProvider(), 200) {
+                @Override
+                public void onSelectionChanged(int selStart, int selEnd) {
+                    super.onSelectionChanged(selStart, selEnd);
+                    if (!isUpdatingText && selStart >= 0) {
+                        updateCursorFromCharOffset(selStart);
+                    }
+                }
+            };
+            editText.setFocusable(true);
+            editText.setFocusableInTouchMode(true);
+            editText.setClickable(true);
+            editText.setLongClickable(true);
+            editText.setShowSoftInputOnFocus(false);
+            editText.setCursorVisible(true);
+            editText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22);
+            editText.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+            editText.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+            editText.setGravity(Gravity.TOP | Gravity.LEFT);
+            editText.setMinLines(1);
+            editText.setBackground(null);
+            editText.setIncludeFontPadding(true);
+            editText.setMaxLines(20);
+            editText.setPadding(AndroidUtilities.dp(4), AndroidUtilities.dp(8),
+                    AndroidUtilities.dp(4), AndroidUtilities.dp(8));
+            editRow.addView(editText, new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+            backspaceView = new BackSpaceButtonView(context, getResourceProvider());
+            backspaceView.setOnBackspace(new Utilities.Callback<Boolean>() {
+                @Override
+                public void run(Boolean fast) {
+                    if (selected.isEmpty()) {
+                        return;
+                    }
+                    if (cursorIndex > 0) {
+                        selected.remove(cursorIndex - 1);
+                        cursorIndex--;
+                    } else if (!selected.isEmpty()) {
+                        selected.remove(0);
+                        cursorIndex = 0;
+                    }
+                    changed = true;
+                    updateUi();
+                }
+            });
+            LinearLayout.LayoutParams bsLp = new LinearLayout.LayoutParams(
+                    AndroidUtilities.dp(42), AndroidUtilities.dp(42));
+            bsLp.leftMargin = AndroidUtilities.dp(6);
+            editRow.addView(backspaceView, bsLp);
+
+            card.addView(editRow, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            topContainer.addView(card);
+
+            TextView hintView = new TextView(context);
+            hintView.setText(loc(
+                    "Tap a reaction above to move the cursor. Tap an emoji below to add or remove it, or ⌫ to delete.",
+                    "Нажмите на реакцию выше, чтобы переставить курсор. Нажмите на эмодзи внизу чтобы добавить или убрать, или ⌫ для удаления."
+            ));
+            hintView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+            hintView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+            hintView.setPadding(AndroidUtilities.dp(18), AndroidUtilities.dp(2),
+                    AndroidUtilities.dp(18), AndroidUtilities.dp(12));
+            topContainer.addView(hintView, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            content.addView(topScroll, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+            // ---- Bottom native SelectAnimatedEmojiDialog (TYPE_CHAT_REACTIONS = 6) + BackSpace ----
+            bottomWrap = new FrameLayout(context);
+            bottomWrap.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+            bottomWrap.setPadding(0, 0, 0, AndroidUtilities.navigationBarHeight);
+
+            emojiDialog = new SelectAnimatedEmojiDialog(
+                    this, context, false, null, 6,
+                    false, getResourceProvider(), 16,
+                    Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, getResourceProvider())) {
+            };
+            installPickerHooks();
+            emojiDialog.setDrawBackground(false);
+            emojiDialog.setAnimationsEnabled(false);
+            emojiDialog.setClipChildren(false);
+            emojiDialog.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+
+            ArrayList<Object> recents = new ArrayList<>();
+            LinkedHashSet<String> seenRecent = new LinkedHashSet<>();
+            for (int i = 0; i < selected.size(); i++) {
+                Object vr = itemToVr(selected.get(i), currentAccount);
+                if (vr != null && seenRecent.add(keyOf(vr))) {
+                    recents.add(vr);
                 }
             }
-        });
-        builder.setNegativeButton(loc("Cancel", "Отмена"), null);
-        AlertDialog dialog = builder.create();
-        try {
-            if (dialog.getWindow() != null) {
-                dialog.getWindow().setSoftInputMode(
-                        android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            List<String> std = standardEmojis(currentAccount);
+            for (int i = 0; i < std.size(); i++) {
+                String se = std.get(i);
+                if (se == null || se.isEmpty()) {
+                    continue;
+                }
+                Object vr = vrFromEmojicon(matchEmoticon(se, currentAccount));
+                if (vr != null && seenRecent.add(keyOf(vr))) {
+                    recents.add(vr);
+                }
             }
-        } catch (Throwable ignore) {
-        }
-        dialog.show();
-        // Native flow always calls onShow() after the dialog is visible —
-        // it starts the reveal animation; without it tabs stay at scale 0
-        // and the picker appears blank (but still clickable).
-        try {
-            emojiDialog.onShow(new Runnable() {
+            try {
+                SelectAnimatedEmojiDialog.class
+                        .getMethod("setRecentReactions", List.class)
+                        .invoke(emojiDialog, recents);
+            } catch (Throwable ignore) {
+            }
+
+            bottomWrap.addView(emojiDialog, LayoutHelper.createFrame(-1, -2, Gravity.BOTTOM));
+
+            content.addView(bottomWrap, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            updateUi();
+            emojiDialog.post(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        dialog.dismiss();
+                        emojiDialog.onShow(null);
+                        if (editText != null) {
+                            editText.requestFocus();
+                        }
                     } catch (Throwable ignore) {
                     }
                 }
             });
-        } catch (Throwable ignore) {
+            return fragmentView = root;
         }
-        refreshUi.run();
+
+        private void toggleEmoji(String key) {
+            if (key == null || key.isEmpty()) {
+                return;
+            }
+            int existing = selected.indexOf(key);
+            if (existing >= 0) {
+                selected.remove(existing);
+                if (cursorIndex > existing) {
+                    cursorIndex--;
+                }
+            } else {
+                int pos = Math.max(0, Math.min(cursorIndex, selected.size()));
+                selected.add(pos, key);
+                cursorIndex = pos + 1;
+            }
+            changed = true;
+            updateUi();
+        }
+
+        private void updateCursorFromCharOffset(int charOffset) {
+            if (itemCharOffsets.isEmpty()) {
+                cursorIndex = 0;
+                return;
+            }
+            int bestIdx = 0;
+            int bestDist = Integer.MAX_VALUE;
+            for (int i = 0; i < itemCharOffsets.size(); i++) {
+                int dist = Math.abs(itemCharOffsets.get(i) - charOffset);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIdx = i;
+                }
+            }
+            cursorIndex = bestIdx;
+        }
+
+        private void updateSubtitle() {
+            if (actionBar != null) {
+                actionBar.setSubtitle(selected.size() + " " + loc("reactions", "реакций"));
+            }
+        }
+
+        private void updateUi() {
+            updateSubtitle();
+            if (countBadge != null) {
+                countBadge.setText(String.valueOf(selected.size()));
+            }
+            if (editText != null) {
+                isUpdatingText = true;
+                try {
+                    SpannableStringBuilder ssb = new SpannableStringBuilder();
+                    itemCharOffsets.clear();
+                    for (int i = 0; i < selected.size(); i++) {
+                        itemCharOffsets.add(ssb.length());
+                        String item = selected.get(i);
+                        if (item.startsWith("doc:")) {
+                            try {
+                                long docId = Long.parseLong(item.substring(4).trim());
+                                AnimatedEmojiSpan span = ReactionsUtils.createAnimatedEmojiSpan(
+                                        null, docId, editText.getFontMetricsInt());
+                                span.setAdded();
+                                ssb.append(ReactionsUtils.createSpannableText(span, "b"));
+                            } catch (Throwable t) {
+                                ssb.append("\u2B50");
+                            }
+                        } else {
+                            String emoji = item.startsWith("e:") ? item.substring(2) : item;
+                            String norm = emoji.replace("\uFE0F", "");
+                            TLRPC.TL_availableReaction avail = availableByEmoji.get(norm);
+                            if (avail != null && avail.activate_animation != null) {
+                                AnimatedEmojiSpan span = ReactionsUtils.createAnimatedEmojiSpan(
+                                        avail.activate_animation, avail.activate_animation.id,
+                                        editText.getFontMetricsInt());
+                                span.setAdded();
+                                ssb.append(ReactionsUtils.createSpannableText(span, avail.reaction));
+                            } else {
+                                try {
+                                    CharSequence cs = Emoji.replaceEmoji(
+                                            emoji, editText.getFontMetricsInt(), false);
+                                    ssb.append(cs);
+                                } catch (Throwable t) {
+                                    ssb.append(emoji);
+                                }
+                            }
+                        }
+                    }
+                    itemCharOffsets.add(ssb.length());
+                    editText.setHint(selected.isEmpty()
+                            ? loc("Tap emoji below", "Нажмите на эмодзи внизу")
+                            : null);
+                    editText.setText(ssb);
+                    if (cursorIndex < 0) {
+                        cursorIndex = 0;
+                    }
+                    if (cursorIndex >= itemCharOffsets.size()) {
+                        cursorIndex = itemCharOffsets.size() - 1;
+                    }
+                    int targetChar = itemCharOffsets.get(cursorIndex);
+                    editText.setSelection(Math.min(targetChar, ssb.length()));
+                } finally {
+                    isUpdatingText = false;
+                }
+            }
+            if (emojiDialog != null) {
+                syncDialogSelection(emojiDialog, selected, currentAccount);
+            }
+        }
+
+        private void saveAndExit() {
+            if (changed) {
+                saveReactionsToPrefs(selected);
+                readPrefsIntoConfig();
+            }
+            finishFragment();
+        }
+
+        @Override
+        public void onResume() {
+            super.onResume();
+            if (editText != null) {
+                editText.setFocusable(true);
+                editText.setFocusableInTouchMode(true);
+                editText.requestFocus();
+            }
+        }
+
+        @Override
+        public void onPause() {
+            super.onPause();
+            if (editText != null) {
+                editText.setFocusable(false);
+            }
+        }
+
+        @Override
+        public void onTransitionAnimationEnd(boolean isOpen, boolean backward) {
+            super.onTransitionAnimationEnd(isOpen, backward);
+            if (isOpen && !backward) {
+                if (emojiDialog != null) {
+                    try {
+                        emojiDialog.onShow(null);
+                    } catch (Throwable ignore) {
+                    }
+                }
+                if (editText != null) {
+                    editText.setFocusable(true);
+                    editText.setFocusableInTouchMode(true);
+                    editText.requestFocus();
+                }
+            }
+        }
+
+        private void installPickerHooks() {
+            try {
+                Method[] methods = SelectAnimatedEmojiDialog.class.getDeclaredMethods();
+                for (int i = 0; i < methods.length; i++) {
+                    Method m = methods[i];
+                    String name = m.getName();
+                    if ("onReactionClick".equals(name)) {
+                        m.setAccessible(true);
+                        pickerHooks.add(XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override
+                            public void beforeHookedMethod(MethodHookParam param) {
+                                if (param.thisObject != emojiDialog) {
+                                    return;
+                                }
+                                param.setResult(null);
+                                Object reaction = param.args != null && param.args.length > 1 ? param.args[1] : null;
+                                if (reaction == null || vrIsStar(reaction)) {
+                                    return;
+                                }
+                                long docId = vrDocumentId(reaction);
+                                String emojicon = vrEmojicon(reaction);
+                                String key;
+                                if (docId != 0) {
+                                    key = "doc:" + docId;
+                                } else if (emojicon != null) {
+                                    key = normalizeItem("e:" + emojicon);
+                                } else {
+                                    return;
+                                }
+                                toggleEmoji(key);
+                            }
+                        }));
+                    } else if ("onEmojiSelected".equals(name)) {
+                        m.setAccessible(true);
+                        final int argc = m.getParameterTypes().length;
+                        pickerHooks.add(XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override
+                            public void beforeHookedMethod(MethodHookParam param) {
+                                if (param.thisObject != emojiDialog) {
+                                    return;
+                                }
+                                param.setResult(null);
+                                Long documentId = param.args != null && param.args.length > 1 && param.args[1] instanceof Long
+                                        ? (Long) param.args[1] : null;
+                                String emoticon = argc >= 6 && param.args != null && param.args.length > 5 && param.args[5] instanceof String
+                                        ? (String) param.args[5] : null;
+                                if (documentId != null && documentId != 0) {
+                                    toggleEmoji("doc:" + documentId);
+                                } else if (emoticon != null) {
+                                    toggleEmoji(normalizeItem("e:" + emoticon));
+                                }
+                            }
+                        }));
+                    }
+                }
+            } catch (Throwable t) {
+                log("installPickerHooks: " + t);
+            }
+        }
+
+        @Override
+        public void onFragmentDestroy() {
+            for (int i = 0; i < pickerHooks.size(); i++) {
+                try {
+                    pickerHooks.get(i).unhook();
+                } catch (Throwable ignore) {
+                }
+            }
+            pickerHooks.clear();
+            super.onFragmentDestroy();
+        }
+
+        @Override
+        public boolean onBackPressed(boolean isGesture) {
+            saveAndExit();
+            return false;
+        }
     }
 
     private static void syncDialogSelection(SelectAnimatedEmojiDialog dialog,
@@ -1909,15 +2242,17 @@ public class Main {
         if (dialog == null) {
             return;
         }
-        HashSet<ReactionsLayoutInBubble.VisibleReaction> set = new HashSet<>();
+        HashSet<Object> set = new HashSet<>();
         for (int i = 0; i < selected.size(); i++) {
-            ReactionsLayoutInBubble.VisibleReaction vr = itemToVr(selected.get(i), account);
+            Object vr = itemToVr(selected.get(i), account);
             if (vr != null) {
                 set.add(vr);
             }
         }
         try {
-            dialog.setSelectedReactions(set);
+            SelectAnimatedEmojiDialog.class
+                    .getMethod("setSelectedReactions", HashSet.class)
+                    .invoke(dialog, set);
             dialog.notifyDataSetChanged();
         } catch (Throwable ignore) {
         }
@@ -1937,130 +2272,28 @@ public class Main {
         return s.isEmpty() ? s : "e:" + s;
     }
 
-    private static ReactionsLayoutInBubble.VisibleReaction itemToVr(String item, int account) {
+    private static Object itemToVr(String item, int account) {
         try {
             if (item.startsWith("doc:")) {
-                return ReactionsLayoutInBubble.VisibleReaction.fromCustomEmoji(
-                        Long.parseLong(item.substring(4).trim()));
+                return vrFromCustomEmoji(Long.parseLong(item.substring(4).trim()));
             }
             String emoji = item.startsWith("e:") ? item.substring(2) : item;
             emoji = emoji.replace("\uFE0F", "");
             if (emoji.isEmpty()) {
                 return null;
             }
-            return ReactionsLayoutInBubble.VisibleReaction.fromEmojicon(matchEmoticon(emoji, account));
+            return vrFromEmojicon(matchEmoticon(emoji, account));
         } catch (Throwable t) {
             return null;
         }
     }
 
-    private static String keyOf(ReactionsLayoutInBubble.VisibleReaction vr) {
-        if (vr.emojicon != null) {
-            return "e:" + vr.emojicon.replace("\uFE0F", "");
+    private static String keyOf(Object vr) {
+        String em = vrEmojicon(vr);
+        if (em != null) {
+            return "e:" + em.replace("\uFE0F", "");
         }
-        return "d:" + vr.documentId;
-    }
-
-    /** Toggle a reaction, inserting at the cursor when adding. */
-    private static void toggleAt(String key, ArrayList<String> selected, int[] insIdx) {
-        int existing = selected.indexOf(key);
-        if (existing >= 0) {
-            selected.remove(existing);
-            if (insIdx[0] > existing) {
-                insIdx[0]--;
-            }
-        } else {
-            int pos = Math.min(insIdx[0], selected.size());
-            selected.add(pos, key);
-            insIdx[0] = pos + 1;
-        }
-    }
-
-    /** "|" indicator marking where the next reaction will be inserted. */
-    private static View makeCursorView(Context context) {
-        TextView cursor = new TextView(context);
-        cursor.setText("|");
-        cursor.setTag("crr_picker_cursor");
-        cursor.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 24);
-        cursor.setTypeface(Typeface.DEFAULT_BOLD);
-        cursor.setGravity(Gravity.CENTER);
-        cursor.setTextColor(Theme.getColor(Theme.key_featuredStickers_addButton));
-        return cursor;
-    }
-
-    private static View makePreviewCell(Context context, final String item, int account,
-                                        final Runnable onTap, final Runnable onRemove) {
-        FrameLayout cell = new FrameLayout(context);
-        try {
-            if (item.startsWith("doc:")) {
-                try {
-                    long docId = Long.parseLong(item.substring(4).trim());
-                    BackupImageView img = new BackupImageView(context);
-                    AnimatedEmojiDrawable aed = null;
-                    try {
-                        aed = new AnimatedEmojiDrawable(EMOJI_CACHE_PREVIEW, account, docId);
-                    } catch (Throwable ignore) {
-                    }
-                    if (aed == null) {
-                        aed = new AnimatedEmojiDrawable(EMOJI_CACHE_DEFAULT, account, docId);
-                    }
-                    img.setAnimatedEmojiDrawable(aed);
-                    cell.addView(img, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
-                } catch (Throwable ignore) {
-                    addFallbackStar(cell, context);
-                }
-            } else {
-                String emoji = item.startsWith("e:") ? item.substring(2) : item;
-                android.graphics.drawable.Drawable d = null;
-                try {
-                    d = Emoji.getEmojiDrawable(emoji);
-                } catch (Throwable ignore) {
-                }
-                if (d != null) {
-                    ImageView iv = new ImageView(context);
-                    iv.setImageDrawable(d);
-                    iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                    cell.addView(iv, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
-                } else {
-                    TextView tv = new TextView(context);
-                    try {
-                        tv.setText(Emoji.replaceEmoji(emoji, tv.getPaint().getFontMetricsInt(), false));
-                    } catch (Throwable t) {
-                        tv.setText(emoji);
-                    }
-                    tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
-                    tv.setGravity(Gravity.CENTER);
-                    tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-                    cell.addView(tv, LayoutHelper.createFrame(28, 28, Gravity.CENTER));
-                }
-            }
-        } catch (Throwable ignore) {
-        }
-        // tap moves the insertion cursor, long-press removes the reaction
-        cell.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                onTap.run();
-            }
-        });
-        cell.setOnLongClickListener(new View.OnLongClickListener() {
-            @Override
-            public boolean onLongClick(View v) {
-                onRemove.run();
-                return true;
-            }
-        });
-        cell.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 16));
-        return cell;
-    }
-
-    private static void addFallbackStar(FrameLayout cell, Context context) {
-        TextView tv = new TextView(context);
-        tv.setText("\u2B50");
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
-        tv.setGravity(Gravity.CENTER);
-        tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        cell.addView(tv, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
+        return "d:" + vrDocumentId(vr);
     }
 
     // ==================================================================
